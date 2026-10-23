@@ -1,0 +1,11 @@
+{
+  "name": "skills-picker",
+  "owner": { "name": "Leromem" },
+  "plugins": [
+    {
+      "name": "skills-picker",
+      "source": "./",
+      "description": "A Skills button above the prompt: pick skills to apply to your next message or the whole chat."
+    }
+  ]
+}
