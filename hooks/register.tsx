@@ -134,6 +134,8 @@ export const register: Register = on => {
         {chosen.length > 0 && (
           <Button key="skills-clear" label="Clear" plain dimColor onPress={() => void update($, picks, () => [])} />
         )}
+        {/* "Done" sits under the list, often scrolled out of the band: this one is always in view. */}
+        {open && <Button key="skills-minimize" label="▾ Minimize" plain onPress={() => void update($, isOpen, () => false)} />}
       </Box>
     )
 

@@ -50,6 +50,12 @@ test('a once pick reaches one message; a whole-chat pick stays', async ($, on) =
   await submit()
   expect(sent[1]?.at(-1)).toMatch(/: policies\./)
 
+  // Minimize folds the list away and keeps the picks.
+  await ui.press({ key: 'skills-minimize' })
+  expect(await ui.find({ key: 'skills-filter' })).toBeUndefined()
+  expect(await ui.find({ key: 'skills-minimize' })).toBeUndefined()
+  expect((await ui.find({ key: 'skills-toggle' }))?.text).toBe('Skills · 1')
+
   await ui.press({ key: 'skills-clear' })
   await submit()
   expect(sent[2]).toBeUndefined()
