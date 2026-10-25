@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Pick, PickMode, SkillItem } from '../types'
+import type { Pick, PickMode, ProjectDefault, SkillItem } from '../types'
 
 const isOpen = atom({ plugin: 'skills-picker', key: 'isOpen' } as const, false)
 const isShowingAll = atom({ plugin: 'skills-picker', key: 'isShowingAll' } as const, false)
@@ -15,6 +15,9 @@ const uses = atom({ plugin: 'skills-picker', key: 'uses' } as const, {} as Recor
 // Favourites, kept across chats in the store; `isPinning` turns a click into pin/unpin.
 const pins = atom({ plugin: 'skills-picker', key: 'pins' } as const, [] as string[])
 const isPinning = atom({ plugin: 'skills-picker', key: 'isPinning' } as const, false)
+// This chat's project folder (store key) and its saved default, kept across chats in the store.
+const project = atom({ plugin: 'skills-picker', key: 'project' } as const, '')
+const projectDefault = atom({ plugin: 'skills-picker', key: 'projectDefault' } as const, null as ProjectDefault | null)
 
 // How many skills the unfiltered "All skills" row shows before "Show all".
 const PREVIEW = 18
@@ -55,6 +58,57 @@ const startWith = async ($: EngineInterface, name: string): Promise<void> => {
   await $.prompt.fill({ text: `/${name} ${rest}`, mode: 'replace' })
 }
 
+// A whole-chat manual pick: the draft starts with its command again after every send.
+// A draft that already starts with a command (typed /clear, say) is left alone.
+const keepPrefix = async ($: EngineInterface): Promise<void> => {
+  const pick = (await read($, picks)).find(p => p.manual)
+  if (!pick) return
+  const { text } = await $.prompt.read()
+  if (text.startsWith('/')) return
+  await $.prompt.fill({ text: `/${pick.name} ${text}`, mode: 'replace' })
+}
+
+// Takes `/name ` back off the draft when its whole-chat pick ends.
+const dropPrefix = async ($: EngineInterface, name: string): Promise<void> => {
+  const { text } = await $.prompt.read()
+  if (text.startsWith(`/${name} `) || text === `/${name}`) {
+    await $.prompt.fill({ text: text.slice(name.length + 2), mode: 'replace' })
+  }
+}
+
+// One key per folder: `D:\x` and `d:/x` are the same project.
+const projectKey = (cwd: string): string => cwd.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+
+type Defaults = Record<string, ProjectDefault>
+const loadDefaults = async ($: EngineInterface): Promise<Defaults> =>
+  ((await $.store.get('defaults')) as Defaults | undefined) ?? {}
+
+// Writes this project's default (null removes it) to the store and the band.
+const saveDefault = async ($: EngineInterface, value: ProjectDefault | null): Promise<void> => {
+  const key = await read($, project)
+  if (!key) return
+  const all = { ...(await loadDefaults($)) }
+  const isEmpty = !value || (value.skills.length === 0 && !value.manual && !value.note)
+  if (isEmpty) delete all[key]
+  else all[key] = value
+  await $.store.set('defaults', all)
+  await update($, projectDefault, () => (isEmpty ? null : value))
+}
+
+// A new chat (or a /clear) in a project with a default starts with its picks, whole chat.
+// Set when a default puts a manual skill back, so the next band fills the draft once.
+let needsPrefix = false
+const applyDefault = async ($: EngineInterface): Promise<void> => {
+  const saved = await read($, projectDefault)
+  if (!saved) return
+  const restored: Pick[] = saved.skills.map(name => ({ name, mode: 'chat' }))
+  if (saved.manual) restored.push({ name: saved.manual, mode: 'chat', manual: true })
+  await update($, picks, () => restored)
+  needsPrefix = Boolean(saved.manual)
+}
+
+const noteContext = (note: string): string => `The user's standing note for this project, for every message: ${note}`
+
 const instruction = (names: string[]): string =>
   `The user picked these skills in the Skills bar to apply to this message: ${names.join(', ')}.\n` +
   'Before anything else, invoke each one with the Skill tool and follow its instructions while handling this message. ' +
@@ -66,13 +120,23 @@ export const register: Register = on => {
     if (saved) await update($, uses, () => saved)
     const pinned = (await $.store.get('pins')) as string[] | undefined
     if (pinned) await update($, pins, () => pinned)
+    const key = projectKey(e.cwd)
+    await update($, project, () => key)
+    await update($, projectDefault, () => null)
+    const stored = (await loadDefaults($))[key]
+    if (stored) {
+      await update($, projectDefault, () => stored)
+      await applyDefault($)
+    }
     return next(e)
   })
 
-  // A /clear ends the chat: the picks end with it.
+  // A /clear ends the chat: the picks end with it, and the project's default comes back
+  // (a /clear raises no session.start).
   on('session.end', async ($, e, next) => {
     await update($, picks, () => [])
     await update($, isOpen, () => false)
+    await applyDefault($).catch(() => undefined)
     return next(e)
   })
 
@@ -87,18 +151,40 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     const isPerson = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
     // A failed read never holds up the message: it goes out without picks.
-    const chosen = await read($, picks).catch(() => [] as Pick[])
-    if (!isPerson || e.command || e.isMeta || chosen.length === 0) return next(e)
+    const all = await read($, picks).catch(() => [] as Pick[])
+    // Manual picks travel as the slash command itself, never as an instruction.
+    const chosen = all.filter(p => !p.manual)
+    const note = (await read($, projectDefault).catch(() => null))?.note
+    if (!isPerson || e.isMeta || (all.length === 0 && !note)) return next(e)
 
-    const result = await next({ ...e, context: [...(e.context ?? []), instruction(chosen.map(p => p.name))] })
+    // The note goes with every message, a slash command's too; picks only with plain ones.
+    const usesPicks = !e.command && chosen.length > 0
+    const added = [
+      ...(note ? [noteContext(note)] : []),
+      ...(usesPicks ? [instruction(chosen.map(p => p.name))] : []),
+    ]
+    const result = await next(added.length ? { ...e, context: [...(e.context ?? []), ...added] } : e)
     if (!('drop' in result)) {
-      await update($, picks, prev => prev.filter(p => p.mode === 'chat')).catch(() => undefined)
+      if (usesPicks) await update($, picks, prev => prev.filter(p => p.mode === 'chat')).catch(() => undefined)
+      await keepPrefix($).catch(() => undefined)
     }
+    return result
+  })
+
+  // The draft may only clear after the submit hook: put the command back once the turn ends too.
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    await keepPrefix($).catch(() => undefined)
     return result
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
+    // A default's manual skill: the prompt box exists by the first band, so fill it here once.
+    if (needsPrefix) {
+      needsPrefix = false
+      void keepPrefix($).catch(() => undefined)
+    }
     // Other mods' bands (savvy-progress, handoff) draw beneath this one: keep them.
     const rest = await next(e)
 
@@ -109,6 +195,7 @@ export const register: Register = on => {
     const open = await read($, isOpen)
     const chosen = await read($, picks)
     const current = await read($, mode)
+    const saved = await read($, projectDefault)
 
     const toggle = (name: string) =>
       update($, picks, prev =>
@@ -131,8 +218,20 @@ export const register: Register = on => {
         {!open && chosen.length > 0 && (
           <Text dimColor>{chosen.map(p => `${p.name} (${modeLabel(p.mode)})`).join(' · ')}</Text>
         )}
+        {!open && saved?.note && <Text dimColor>Note: {saved.note}</Text>}
         {chosen.length > 0 && (
-          <Button key="skills-clear" label="Clear" plain dimColor onPress={() => void update($, picks, () => [])} />
+          <Button
+            key="skills-clear"
+            label="Clear"
+            plain
+            dimColor
+            onPress={() =>
+              void (async () => {
+                for (const p of chosen.filter(c => c.manual)) await dropPrefix($, p.name)
+                await update($, picks, () => [])
+              })()
+            }
+          />
         )}
         {/* "Done" sits under the list, often scrolled out of the band: this one is always in view. */}
         {open && <Button key="skills-minimize" label="▾ Minimize" plain onPress={() => void update($, isOpen, () => false)} />}
@@ -174,11 +273,26 @@ export const register: Register = on => {
         )
       }
       if (s.source === 'manual') {
+        const kept = chosen.find(c => c.name === s.name)
+        // "Next message only" fills the draft once; "Whole chat" keeps it in front of every message.
+        const press = async () => {
+          if (kept) {
+            await update($, picks, prev => prev.filter(p => p.name !== s.name))
+            await dropPrefix($, s.name)
+            return
+          }
+          if (current === 'chat') {
+            await update($, picks, prev => [...prev.filter(p => !p.manual), { name: s.name, mode: 'chat', manual: true }])
+          }
+          await startWith($, s.name)
+          await update($, isOpen, () => false)
+        }
         return (
           <Button
             key={`${section}:${s.name}`}
-            label={`/${s.name}`}
-            onPress={() => void startWith($, s.name).then(() => update($, isOpen, () => false)).catch(() => $.ui.toast(`Couldn't start /${s.name}`))}
+            label={kept ? `✓ /${s.name} · whole chat` : `/${s.name}`}
+            variant={kept ? 'primary' : undefined}
+            onPress={() => void press().catch(() => $.ui.toast(`Couldn't start /${s.name}`))}
           />
         )
       }
@@ -231,7 +345,7 @@ export const register: Register = on => {
           {pinned.length === 0 && !pinning && <Text dimColor>No pinned skills yet: press “☆ Pin skills” to add favourites.</Text>}
           {row('most', 'Most used', most)}
           {row('project', `This project · ${project.length}`, project)}
-          {row('manual', `Manual · ${manualList.length} · starts your message with the command`, manualList)}
+          {row('manual', `Manual · ${manualList.length} · starts your message with the command (Whole chat: every message)`, manualList)}
           {row('all', `All skills · ${list.length}`, all)}
           {list.length > PREVIEW && (
             <Button
@@ -261,6 +375,52 @@ export const register: Register = on => {
           />
         </Box>
         {pinning && <Text dimColor>Click a skill to pin or unpin it. Pins stay in every chat.</Text>}
+        <Box key="skills-default" flexDirection="column">
+          <Text dimColor>
+            {saved && (saved.skills.length > 0 || saved.manual)
+              ? `This project's default (every new chat here): ${[...saved.skills, ...(saved.manual ? [`/${saved.manual}`] : [])].join(', ')}`
+              : 'This project has no default picks: pick skills, then save them so every new chat here starts with them.'}
+          </Text>
+          <Box flexDirection="row" gap={1} flexWrap="wrap">
+            {chosen.length > 0 && (
+              <Button
+                key="skills-default-save"
+                label="Save picks as project default"
+                onPress={() =>
+                  void saveDefault($, {
+                    skills: chosen.filter(p => !p.manual).map(p => p.name),
+                    manual: chosen.find(p => p.manual)?.name,
+                    note: saved?.note,
+                  }).then(() => $.ui.toast('Saved: new chats in this project start with these picks'))
+                }
+              />
+            )}
+            {saved && (saved.skills.length > 0 || saved.manual) && (
+              <Button
+                key="skills-default-clear"
+                label="Remove project default"
+                plain
+                dimColor
+                onPress={() => void saveDefault($, { skills: [], note: saved.note })}
+              />
+            )}
+          </Box>
+          {Input && (
+            <Input
+              key="skills-note"
+              placeholder="Standing note for this project, sent with every message (e.g. time matters here)"
+              submitLabel="save note"
+              value={saved?.note ?? ''}
+              onSubmit={(v: string) =>
+                void saveDefault($, {
+                  skills: saved?.skills ?? [],
+                  manual: saved?.manual,
+                  note: v.trim() || undefined,
+                })
+              }
+            />
+          )}
+        </Box>
         {Input && (
           <Input
             key="skills-filter"

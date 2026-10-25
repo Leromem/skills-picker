@@ -1,6 +1,6 @@
 {
   "name": "skills-picker",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A Skills button above the prompt: pick skills to apply to your next message or the whole chat.",
   "types": "./types/index.d.ts"
 }

@@ -1,6 +1,10 @@
 export type PickMode = 'once' | 'chat'
-export type Pick = { name: string; mode: PickMode }
+// `manual`: a slash-command skill kept at the front of every message for the whole chat.
+export type Pick = { name: string; mode: PickMode; manual?: true }
 export type SkillItem = { name: string; source: string }
+// A project's saved setup, restored as whole-chat picks in every new chat there.
+// `note`: a standing line (e.g. "time matters here") sent with every message.
+export type ProjectDefault = { skills: string[]; manual?: string; note?: string }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -15,6 +19,8 @@ declare module 'claude-code' {
       uses: Record<string, number>
       pins: string[]
       isPinning: boolean
+      project: string
+      projectDefault: ProjectDefault | null
     }
   }
 }
